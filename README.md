@@ -32,8 +32,8 @@ You do **not** need to install PostgreSQL. In development the API uses an embedd
 ## 2. Run it locally (5 minutes)
 
 ```bash
-git clone https://github.com/RiyanshiTomar/Flight_Home_Project.git
-cd Flight_Home_Project
+git clone https://github.com/RiyanshiTomar/Flight_CarPooling.git
+cd Flight_CarPooling
 ```
 
 ### Terminal 1: backend
@@ -181,7 +181,7 @@ Two travellers are compatible when they are at the **same airport**, land within
 ## 8. Project layout
 
 ```
-Flight_Home_Project/
+Flight_CarPooling/
 ├── README.md
 ├── ARCHITECTURE.md / FlyPool_Architecture.pdf   design + scaling plan
 ├── docker-compose.yml                            optional real Postgres
@@ -210,7 +210,7 @@ git init
 git add .
 git commit -m "FlyPool: web UI and API (phase 2)"
 git branch -M main
-git remote add origin https://github.com/RiyanshiTomar/Flight_Home_Project.git
+git remote add origin https://github.com/RiyanshiTomar/Flight_CarPooling.git
 git push -u origin main
 ```
 
