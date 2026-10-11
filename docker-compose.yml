@@ -1,0 +1,12 @@
+# Optional: real PostgreSQL for production-like testing.   docker compose up -d
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: flypool
+      POSTGRES_PASSWORD: flypool
+      POSTGRES_DB: flypool
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+volumes:
+  pgdata:
