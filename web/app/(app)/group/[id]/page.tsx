@@ -1,6 +1,6 @@
 import { Suspense } from "react";
-import { GroupView } from "./GroupView";
 import { Loading } from "@/components/States";
+import { GroupView } from "./GroupView";
 
 export default function GroupPage() {
   return (

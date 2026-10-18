@@ -1,61 +1,49 @@
-import { Body, Controller, Get, Patch, Post, UseGuards } from '@nestjs/common';
-import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { Body, Controller, HttpCode, Post } from '@nestjs/common';
+import { ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
-import { IsIn, IsOptional, IsString, Length, MaxLength } from 'class-validator';
-import { DbService } from '../db/db.service';
-import { AuthGuard, AuthUser, CurrentUser } from './auth.guard';
+import { IsString, Length } from 'class-validator';
 import { AuthService } from './auth.service';
 
 class RequestOtpDto {
-  @IsString() phone: string;
+  @IsString() @Length(10, 16) phone: string;
 }
 class VerifyOtpDto {
-  @IsString() phone: string;
+  @IsString() @Length(10, 16) phone: string;
   @IsString() @Length(6, 6) code: string;
 }
-class UpdateMeDto {
-  @IsOptional() @IsString() @MaxLength(60) name?: string;
-  @IsOptional() @IsIn(['female', 'male', 'other']) gender?: 'female' | 'male' | 'other';
+class RefreshDto {
+  @IsString() @Length(20, 200) refreshToken: string;
 }
 
 @ApiTags('auth')
-@Controller()
+@Controller('auth')
 export class AuthController {
-  constructor(private readonly auth: AuthService, private readonly db: DbService) {}
+  constructor(private readonly auth: AuthService) {}
 
   // strict limit: SMS costs money and OTPs are brute-forceable
   @Throttle({ default: { limit: Number(process.env.OTP_RATE_LIMIT ?? 5), ttl: 60_000 } })
-  @Post('auth/otp/request')
+  @Post('otp/request')
   request(@Body() dto: RequestOtpDto) {
     return this.auth.requestOtp(dto.phone);
   }
 
-  @Throttle({ default: { limit: 10, ttl: 60_000 } })
-  @Post('auth/otp/verify')
+  @Throttle({ default: { limit: Number(process.env.OTP_RATE_LIMIT ?? 10), ttl: 60_000 } })
+  @Post('otp/verify')
   verify(@Body() dto: VerifyOtpDto) {
     return this.auth.verifyOtp(dto.phone, dto.code);
   }
 
-  @ApiBearerAuth()
-  @UseGuards(AuthGuard)
-  @Get('me')
-  async me(@CurrentUser() u: AuthUser) {
-    const [row] = await this.db.query(
-      'select id, phone, name, gender, verified_level, rating_avg, trips_count, created_at from users where id = $1',
-      [u.id],
-    );
-    return row;
+  /** Swap a refresh token for a new access token + a new refresh token (the old one stops working). */
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
+  @Post('refresh')
+  @HttpCode(200)
+  refresh(@Body() dto: RefreshDto) {
+    return this.auth.refresh(dto.refreshToken);
   }
 
-  @ApiBearerAuth()
-  @UseGuards(AuthGuard)
-  @Patch('me')
-  async update(@CurrentUser() u: AuthUser, @Body() dto: UpdateMeDto) {
-    const [row] = await this.db.query(
-      `update users set name = coalesce($2, name), gender = coalesce($3, gender) where id = $1
-       returning id, phone, name, gender, verified_level, rating_avg, trips_count`,
-      [u.id, dto.name ?? null, dto.gender ?? null],
-    );
-    return row;
+  @Post('logout')
+  @HttpCode(200)
+  logout(@Body() dto: RefreshDto) {
+    return this.auth.logout(dto.refreshToken);
   }
 }

@@ -13,6 +13,7 @@
     "@nestjs/throttler": "^6.0.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
+    "helmet": "^8.3.0",
     "pg": "^8.23.1",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2"
@@ -23,7 +24,7 @@
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main",
     "test": "jest",
-    "test:e2e": "nest build && node --test test/e2e.test.mjs",
+    "test:e2e": "nest build && node --test test/e2e.test.mjs test/jobs.test.mjs",
     "test:all": "npm test && npm run test:e2e"
   },
   "engines": {

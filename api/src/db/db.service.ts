@@ -18,12 +18,22 @@ export class DbService implements OnModuleInit, OnModuleDestroy, Queryable {
   private readonly log = new Logger('Db');
   private pool?: import('pg').Pool;
   private lite?: import('@electric-sql/pglite').PGlite;
+  private listener?: import('pg').PoolClient;
+  private closing = false;
 
   async onModuleInit() {
     const url = process.env.DATABASE_URL;
     if (url) {
       const { Pool } = await import('pg');
-      this.pool = new Pool({ connectionString: url, max: Number(process.env.DB_POOL_MAX ?? 10) });
+      this.pool = new Pool({
+        connectionString: url,
+        max: Number(process.env.DB_POOL_MAX ?? 10),
+        idleTimeoutMillis: 30_000,
+        connectionTimeoutMillis: 10_000,
+        ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: process.env.DATABASE_SSL_REJECT_UNAUTHORIZED !== 'false' } : undefined,
+      });
+      // an idle client dying (DB restart, network blip) must not crash the process
+      this.pool.on('error', (e) => this.log.warn(`Idle DB client error: ${e.message}`));
       await this.pool.query('select 1');
       this.log.log('Connected to PostgreSQL');
     } else {
@@ -37,7 +47,43 @@ export class DbService implements OnModuleInit, OnModuleDestroy, Queryable {
     await this.migrate();
   }
 
+  get isPostgres() {
+    return !!this.pool;
+  }
+
+  /**
+   * Cross-instance pub/sub through Postgres LISTEN/NOTIFY (real Postgres only).
+   * Returns false on embedded PGlite, where everything runs in one process anyway.
+   */
+  async listen(channel: string, onPayload: (payload: string) => void): Promise<boolean> {
+    if (!this.pool) return false;
+    const connect = async () => {
+      try {
+        const client = await this.pool!.connect();
+        client.on('notification', (m) => m.channel === channel && m.payload && onPayload(m.payload));
+        client.on('error', (e) => {
+          this.log.warn(`LISTEN connection lost (${e.message}), reconnecting`);
+          client.release(true);
+          if (!this.closing) setTimeout(connect, 2000);
+        });
+        await client.query(`LISTEN ${channel}`);
+        this.listener = client;
+      } catch (e: any) {
+        this.log.warn(`LISTEN failed (${e.message}), retrying`);
+        if (!this.closing) setTimeout(connect, 5000);
+      }
+    };
+    await connect();
+    return true;
+  }
+
+  async notify(channel: string, payload: string) {
+    await this.query('select pg_notify($1, $2)', [channel, payload]);
+  }
+
   async onModuleDestroy() {
+    this.closing = true;
+    this.listener?.release();
     await this.pool?.end();
     await this.lite?.close();
   }

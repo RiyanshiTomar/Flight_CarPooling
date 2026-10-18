@@ -10,12 +10,14 @@ import { AuthService } from './auth.service';
     JwtModule.registerAsync({
       useFactory: () => ({
         secret: process.env.JWT_SECRET,
-        signOptions: { expiresIn: (process.env.JWT_EXPIRES_IN ?? '7d') as any },
+        // short-lived: the website renews it silently with the refresh token
+        signOptions: { expiresIn: (process.env.JWT_EXPIRES_IN ?? '15m') as any, issuer: 'flypool' },
+        verifyOptions: { issuer: 'flypool' },
       }),
     }),
   ],
   controllers: [AuthController],
   providers: [AuthService, AuthGuard],
-  exports: [AuthGuard, JwtModule],
+  exports: [AuthGuard, AuthService, JwtModule],
 })
 export class AuthModule {}
