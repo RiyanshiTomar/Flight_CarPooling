@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { configureApp, loadEnv } from './setup';
@@ -7,17 +8,23 @@ async function bootstrap() {
   loadEnv();
   // AppModule is imported after env is loaded because modules read process.env at definition time
   const { AppModule } = await import('./app.module');
-  const app = await NestFactory.create(AppModule);
+  const prod = process.env.NODE_ENV === 'production';
+  const app = await NestFactory.create(AppModule, { logger: prod ? ['error', 'warn', 'log'] : undefined });
   configureApp(app);
 
-  const docs = SwaggerModule.createDocument(
-    app,
-    new DocumentBuilder().setTitle('FlyPool API').setVersion('0.1').addBearerAuth().build(),
-  );
-  SwaggerModule.setup('docs', app, docs);
+  if (!prod || process.env.SWAGGER === 'true') {
+    const docs = SwaggerModule.createDocument(
+      app,
+      new DocumentBuilder().setTitle('FlyPool API').setVersion('2.0').addBearerAuth().build(),
+    );
+    SwaggerModule.setup('docs', app, docs);
+  }
 
   const port = Number(process.env.PORT ?? 4000);
-  await app.listen(port);
-  console.log(`FlyPool API  http://localhost:${port}   docs: http://localhost:${port}/docs`);
+  await app.listen(port, '0.0.0.0');
+  new Logger('Boot').log(`FlyPool API on :${port}${prod ? '' : `   docs: http://localhost:${port}/docs`}`);
 }
-bootstrap();
+bootstrap().catch((e) => {
+  console.error(e instanceof Error ? e.message : e);
+  process.exit(1);
+});

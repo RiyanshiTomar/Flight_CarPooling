@@ -1,5 +1,6 @@
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { DbService } from '../db/db.service';
+import { EventsService } from '../events/events.service';
 import { FlightsService } from '../flights/flights.service';
 import { GroupsService, RequestRow } from '../groups/groups.service';
 import { MATCH } from '../matching/matching.util';
@@ -14,24 +15,32 @@ export interface CreateRequestInput {
   airport?: string;
 }
 
+const ACTIVE = ['PENDING', 'MATCHED', 'CONFIRMED'];
+
 @Injectable()
 export class RequestsService {
   constructor(
     private readonly db: DbService,
     private readonly flights: FlightsService,
     private readonly groups: GroupsService,
+    private readonly events: EventsService,
   ) {}
 
   async create(userId: string, input: CreateRequestInput) {
-    const [user] = await this.db.query('select id, gender from users where id = $1', [userId]);
+    const [user] = await this.db.query('select id, gender, name from users where id = $1', [userId]);
+    if (!user?.name) throw new BadRequestException('Add your name to your profile first');
     if (input.womenOnly && user.gender !== 'female') {
       throw new BadRequestException('Women-only matching needs gender set to "female" on your profile');
     }
 
     // 1. the flight tells us where and when the person lands
     const flight = await this.flights.lookup(input.flightNo, input.date, input.airport);
+    if (flight.status === 'cancelled') throw new BadRequestException(`${flight.flightNo} on ${input.date} is cancelled`);
     const [airport] = await this.db.query('select id, iata from airports where iata = $1 and active = true', [flight.destIata]);
-    if (!airport) throw new BadRequestException(`FlyPool is not live at ${flight.destIata} yet`);
+    if (!airport) throw new BadRequestException(`${flight.flightNo} lands at ${flight.destIata}. FlyPool is not live there yet.`);
+    if (input.airport && input.airport !== flight.destIata) {
+      throw new BadRequestException(`${flight.flightNo} lands at ${flight.destIata}, not ${input.airport}. Check the airport.`);
+    }
 
     // 2. destination must be a known area at that airport
     const [place] = await this.db.query('select * from places where id = $1 and airport_id = $2', [input.destPlaceId, airport.id]);
@@ -42,8 +51,9 @@ export class RequestsService {
     if (expires < new Date()) throw new BadRequestException('This flight has already landed');
 
     // 3. store + find a group, atomically
+    let result;
     try {
-      return await this.db.tx(async (q) => {
+      result = await this.db.tx(async (q) => {
         const [row] = await q.query(
           `insert into ride_requests (user_id, airport_id, flight_no, flight_date, terminal, eta, dest_label, dest_lat, dest_lng,
                                       est_solo_fare, seats, luggage, women_only, expires_at)
@@ -54,40 +64,65 @@ export class RequestsService {
         const suggestions = await this.groups.suggestions(q, row as RequestRow, user.gender);
         // Nobody to join yet: open a group of one so later arrivals can find this person.
         const groupId = suggestions.length ? null : await this.groups.createFor(q, row as RequestRow);
-        return { request: this.present(row), flight: this.presentFlight(flight), suggestions, groupId };
+        return { request: this.present({ ...row, group_id: groupId, group_status: groupId ? 'OPEN' : null }), flight: this.presentFlight(flight), suggestions, groupId };
       });
     } catch (e: any) {
-      if (e?.code === '23505') throw new ConflictException('You already have an active request for this flight');
+      if (e?.code === '23505') throw new ConflictException('You already have an active request for this flight. Open it from My trips.');
       throw e;
     }
+    return result;
   }
 
   async listMine(userId: string) {
     const rows = await this.db.query(
-      `select r.*, gm.group_id from ride_requests r
+      `select r.*, gm.group_id, g.status as group_status, g.pickup_point,
+              (select count(*)::int from group_members x where x.group_id = gm.group_id) as member_count
+       from ride_requests r
        left join group_members gm on gm.request_id = r.id
-       where r.user_id = $1 order by r.created_at desc limit 50`,
+       left join groups g on g.id = gm.group_id
+       where r.user_id = $1 order by r.eta desc limit 50`,
       [userId],
     );
-    return rows.map((r) => ({ ...this.present(r), groupId: r.group_id ?? null }));
+    return rows.map((r) => this.present(r));
   }
 
   async suggestionsFor(userId: string, requestId: string) {
     const [r] = await this.db.query('select r.*, u.gender from ride_requests r join users u on u.id = r.user_id where r.id = $1 and r.user_id = $2', [requestId, userId]);
     if (!r) throw new NotFoundException('Ride request not found');
+    if (!ACTIVE.includes(r.status)) return [];
     return this.groups.suggestions(this.db, r as RequestRow, r.gender);
   }
 
+  /** Skip the suggestions and start a fresh group of your own. */
+  async ownGroup(userId: string, requestId: string) {
+    const out = await this.db.tx(async (q) => {
+      const [r] = await q.query(`select * from ride_requests where id = $1 and user_id = $2 and status in ('PENDING','MATCHED')`, [requestId, userId]);
+      if (!r) throw new NotFoundException('Active request not found');
+      const old = await this.groups.removeMember(q, requestId);
+      const groupId = await this.groups.createFor(q, r as RequestRow);
+      return { view: await this.groups.view(q, groupId, userId), old };
+    });
+    if (out.old) await this.events.toGroup(out.old, { type: 'group.updated' });
+    return out.view;
+  }
+
   async cancel(userId: string, requestId: string) {
-    return this.db.tx(async (q) => {
+    const out = await this.db.tx(async (q) => {
       const [r] = await q.query(
-        `update ride_requests set status = 'CANCELLED' where id = $1 and user_id = $2 and status in ('PENDING','MATCHED','CONFIRMED') returning id`,
+        `update ride_requests r set status = 'CANCELLED' from users u
+         where r.id = $1 and r.user_id = $2 and u.id = r.user_id and r.status in ('PENDING','MATCHED','CONFIRMED') returning u.name`,
         [requestId, userId],
       );
       if (!r) throw new NotFoundException('Active ride request not found');
-      await this.groups.removeMember(q, requestId);
-      return { cancelled: true };
+      const groupId = await this.groups.removeMember(q, requestId);
+      if (groupId) await this.groups.systemMessage(q, groupId, `${(r.name ?? 'A traveller').split(' ')[0]} cancelled their ride.`);
+      return { groupId, name: r.name };
     });
+    if (out.groupId) {
+      await this.events.toGroup(out.groupId, { type: 'group.updated', note: `${(out.name ?? 'A traveller').split(' ')[0]} cancelled` });
+      await this.events.toGroup(out.groupId, { type: 'message.created' });
+    }
+    return { cancelled: true };
   }
 
   private present(r: any) {
@@ -99,9 +134,14 @@ export class RequestsService {
       eta: r.eta,
       destLabel: r.dest_label,
       seats: r.seats,
+      luggage: r.luggage,
       womenOnly: r.women_only,
       status: r.status,
       estSoloFare: r.est_solo_fare,
+      groupId: r.group_id ?? null,
+      groupStatus: r.group_status ?? null,
+      groupSize: r.member_count ?? null,
+      pickupPoint: r.pickup_point ?? null,
     };
   }
 

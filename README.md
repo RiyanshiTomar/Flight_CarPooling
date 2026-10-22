@@ -6,8 +6,8 @@ Launch airport: **Delhi IGI (T3)**, then Bengaluru BLR.
 
 | Part | Folder | Stack | Status |
 |---|---|---|---|
-| Website (mobile-first PWA-ready UI) | [`web/`](web) | Next.js, TypeScript, Tailwind | UI done, runs on mock data |
-| Backend API | [`api/`](api) | NestJS, TypeScript, PostgreSQL | Phase 2 done: auth, flights, matching, groups, chat |
+| Website (mobile-first, installable PWA) | [`web/`](web) | Next.js, TypeScript, Tailwind | v2: new design, live updates, full ride lifecycle, safety tools |
+| Backend API | [`api/`](api) | NestJS, TypeScript, PostgreSQL | v2: refresh tokens, live events (SSE), jobs, ratings, safety, SMS adapter |
 | Architecture and scaling plan | [`ARCHITECTURE.md`](ARCHITECTURE.md), [`FlyPool_Architecture.pdf`](FlyPool_Architecture.pdf) | | Reference |
 
 > **FlyPool is not a cab service.** We only connect travellers who can share a ride. We do not book cabs, run vehicles or collect fares. Any amount shown in the app is a rough estimate of each person's share, paid directly to whichever cab the group books (Uber, Ola, prepaid taxi...).
@@ -67,7 +67,8 @@ Website settings (`web/.env.local`):
 | Variable | Default | Meaning |
 |---|---|---|
 | `NEXT_PUBLIC_API_URL` | `http://localhost:4000` | Where the API lives |
-| `NEXT_PUBLIC_DATA_SOURCE` | unset | `mock` = offline demo data instead of the API |
+| `NEXT_PUBLIC_SITE_URL` | `http://localhost:3000` | Public URL of the website (link previews) |
+| `NEXT_PUBLIC_DATA_SOURCE` | unset | `mock` = offline demo data instead of the API (demo OTP `123456`) |
 
 ### Try the API from Swagger (no frontend needed)
 
@@ -88,18 +89,26 @@ Use a **future date**: requests for flights that already landed are rejected.
 
 ## 3. Configuration
 
-All backend settings live in `api/.env` (copy from `api/.env.example`).
+All backend settings live in `api/.env` (copy from `api/.env.example`, every variable is explained there).
+With `NODE_ENV=production` the API **refuses to start** if a setting is unsafe (weak `JWT_SECRET`, `OTP_DEV_ECHO=true`, no `DATABASE_URL`, no SMS provider, no `PUBLIC_WEB_URL`...).
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | `4000` | API port |
-| `DATABASE_URL` | empty | Empty = embedded Postgres. Set for real Postgres, e.g. `postgres://flypool:flypool@localhost:5432/flypool` |
-| `JWT_SECRET` | dev value | **Must** be a long random string in production (`openssl rand -hex 32`) |
-| `OTP_DEV_ECHO` | `true` | Returns the OTP in the response. **Never true in production** (also ignored when `NODE_ENV=production`) |
+| `PUBLIC_WEB_URL` | `http://localhost:3000` | Website URL, used in share links and SOS texts |
+| `DATABASE_URL` | empty | Empty = embedded Postgres. Set for real Postgres |
+| `DATABASE_SSL` | `false` | `true` for managed Postgres that needs TLS |
+| `JWT_SECRET` | dev value | 32+ random characters in production (`openssl rand -hex 32`) |
+| `JWT_EXPIRES_IN` / `REFRESH_TOKEN_DAYS` | `15m` / `30` | Short access token, rotating refresh token |
+| `OTP_DEV_ECHO` | `true` | Returns the OTP in the response. Refused in production |
+| `SMS_PROVIDER` | `console` | `console`, `msg91` or `twilio` (keys in `.env.example`) |
 | `FLIGHT_PROVIDER` | `mock` | `mock` (no key needed) or `aeroapi` |
 | `AEROAPI_KEY` | empty | FlightAware key, only for `aeroapi` |
-| `FLIGHT_CACHE_MINUTES` | `10` | Reuse a flight lookup for this long |
+| `FLIGHT_CACHE_MINUTES` / `FLIGHT_POLL_MINUTES` | `10` / `5` | Flight cache, and how often active flights are re-checked for delays |
+| `JOBS_ENABLED` | `true` | Background jobs (expiry, delay updates, cleanup) |
 | `CORS_ORIGINS` | `http://localhost:3000` | Allowed website origins, comma separated |
+| `TRUST_PROXY` | empty | Proxy hops to trust behind a load balancer (correct client IPs for rate limits) |
+| `SWAGGER` | `false` | Swagger UI at `/docs` is off in production unless `true` |
 
 ---
 
@@ -146,10 +155,18 @@ Why not the others from the research sheet: Aviationstack's free tier (100 reque
 ```bash
 cd api
 npm test            # unit tests (matching rules, fare split)
-npm run test:e2e    # builds, boots the real server, runs 12 end-to-end API tests
+npm run test:e2e    # builds, boots the real server, runs 22 end-to-end API tests + 3 background-job tests
+
+cd ../web
+npm run lint && npx tsc --noEmit && npm run build
 ```
 
-The e2e test covers: login, flight lookup + cache, matching, joining, confirmation, women-only rules, privacy of suggestions, chat access control, cancelling, duplicate requests.
+The e2e tests cover: OTP login (wrong codes, cooldown, single use), refresh-token rotation and reuse detection, flight lookup + cache,
+matching, live events over SSE, joining, pickup changes, confirmation, start/complete/rate, share links, report + block (blocked people
+disappear from matches), leaving a group, cancelling, SOS, women-only rules, privacy (first names only, no phone numbers), account deletion.
+The job tests cover flight-delay updates, request expiry and auto-closing old trips.
+
+GitHub Actions runs all of this on every push and pull request (`.github/workflows/ci.yml`).
 
 ---
 
@@ -157,20 +174,37 @@ The e2e test covers: login, flight lookup + cache, matching, joining, confirmati
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health`, `/airports`, `/places?airport=DEL` | Public catalog |
-| POST | `/auth/otp/request`, `/auth/otp/verify` | Phone OTP login, returns JWT |
-| GET / PATCH | `/me` | Profile |
+| GET | `/health`, `/airports`, `/places?airport=DEL` | Public catalog (`/health` checks the database) |
+| POST | `/auth/otp/request`, `/auth/otp/verify` | Phone OTP login. Returns a 15-min access token + a refresh token |
+| POST | `/auth/refresh`, `/auth/logout` | Rotate tokens (reuse of an old one ends the session), log out |
+| GET / PATCH / DELETE | `/me` | Profile, trusted contact, delete account (DPDP) |
+| GET | `/me/stats` | Rides, money saved, people met |
+| GET | `/events` | **Live updates** (Server-Sent Events) for the logged-in user |
 | GET | `/flights/:flightNo?date=YYYY-MM-DD` | Flight lookup (cached) |
 | POST | `/ride-requests` | Create a request. Returns suggested groups, or opens a new group |
 | GET | `/ride-requests/mine`, `/ride-requests/:id/suggestions` | My requests, fresh suggestions |
 | POST | `/ride-requests/:id/own-group` | Skip suggestions, start my own group |
 | DELETE | `/ride-requests/:id` | Cancel |
-| GET | `/groups/:id` | Group details (members only) |
-| POST | `/groups/:id/join`, `/groups/:id/confirm` | Join, confirm. All confirmed = `CONFIRMED` |
-| | | (Cost fields such as `soloFare` and `perPersonFare` are estimates only) |
-| GET / POST | `/groups/:id/messages` | Group chat (members only) |
+| GET | `/groups/:id` | Group details (members only, first names only) |
+| POST | `/groups/:id/join`, `/confirm`, `/leave` | Join, confirm (all confirmed = `CONFIRMED`), leave (you get a group of one) |
+| PATCH | `/groups/:id/pickup` | Change the meeting point |
+| POST | `/groups/:id/start`, `/complete`, `/ratings` | Ride lifecycle and 1-5 star ratings |
+| GET / POST | `/groups/:id/messages` | Group chat (`?after=` for only new messages) |
+| POST / DELETE | `/groups/:id/share` | Create / turn off a read-only trip link for family |
+| GET | `/share/:token` | Public trip view (no login) |
+| POST | `/safety/reports`, `/safety/blocks`, `/safety/sos` | Report, block, SOS (texts your trusted contact) |
+| GET / DELETE | `/safety/blocks`, `/safety/blocks/:id` | My blocked list, unblock |
 
-Full details and try-it-out: `http://localhost:4000/docs`.
+Every error has one shape: `{ statusCode, message, requestId }`. Full details and try-it-out: `http://localhost:4000/docs`.
+
+### Live updates and background jobs
+
+- The website opens **one** `GET /events` stream after login. Events carry ids only ("group X changed"); the page then re-reads
+  what changed through the normal, permission-checked endpoints. So nothing private travels over the stream.
+- With several API instances on real Postgres, events go through Postgres `LISTEN/NOTIFY`, so no Redis is needed yet.
+- Jobs (`api/src/jobs/jobs.service.ts`) run in the API process, each behind a DB lease so only one instance runs it:
+  expire old requests, re-check flights landing in the next 12 h and move the group's pickup window on delays (with a chat message
+  and a toast), auto-close trips 12 h after pickup, and clean old OTPs/tokens.
 
 ### How matching works (`api/src/matching/matching.util.ts`)
 
@@ -184,19 +218,22 @@ Two travellers are compatible when they are at the **same airport**, land within
 Flight_CarPooling/
 ├── README.md
 ├── ARCHITECTURE.md / FlyPool_Architecture.pdf   design + scaling plan
-├── docker-compose.yml                            optional real Postgres
-├── web/                                          Next.js website
-│   ├── app/                                      pages (landing, login, trip, matches, group, safety, profile)
-│   ├── components/                               shared UI
+├── docker-compose.yml                            full stack (db + api + web), or just the db
+├── .github/workflows/ci.yml                      tests, lint and builds on every push
+├── web/                                          Next.js website (Dockerfile: standalone server)
+│   ├── app/                                      landing, login, trip/new, matches, group, trips, safety, profile,
+│   │                                             share/[token] (public), terms, privacy, 404, error
+│   ├── components/                               UI kit: Modal, Toast, Live (events), OtpInput, Stars, ...
+│   ├── lib/hooks.ts, lib/format.ts
 │   └── lib/services/                             the swappable backend layer
 │       ├── types.ts                              the contract (FlyPoolService)
-│       ├── http.ts                               implementation for the FlyPool API
+│       ├── http.ts                               FlyPool API: token refresh + live events
 │       ├── mock.ts                               offline implementation
 │       └── index.ts                              THE one file that picks the backend
-└── api/                                          NestJS backend
-    ├── migrations/                               append-only SQL (001 schema, 002 seed)
-    ├── src/auth, flights, requests, groups, matching, db, catalog
-    └── test/                                     unit + e2e tests
+└── api/                                          NestJS backend (Dockerfile included)
+    ├── migrations/                               append-only SQL (001 schema, 002 seed, 003 v2)
+    ├── src/auth, users, flights, requests, groups, matching, safety, events, jobs, sms, db, catalog, common
+    └── test/                                     unit + e2e + jobs tests
 ```
 
 ---
@@ -218,12 +255,18 @@ Check before pushing: `git status` must **not** list `.env`, `node_modules`, `.d
 
 ---
 
-## 10. Deploying later (outline)
+## 10. Deploying
 
-- **Website:** Vercel (set the API URL as an environment variable).
-- **API:** any container host (Railway, Render, Fly.io, AWS ECS, Cloud Run). Build with `npm run build`, start with `npm run start:prod`.
-- **Database:** managed PostgreSQL (Neon, Supabase, RDS). Set `DATABASE_URL`.
-- Production settings: `NODE_ENV=production`, strong `JWT_SECRET`, `OTP_DEV_ECHO=false`, and plug in a real SMS provider in `api/src/auth/auth.service.ts` (marked `TODO(prod)`). Without it nobody can log in in production.
+- **Docker:** `docker compose up --build` runs Postgres + API + website locally the production way.
+  `api/Dockerfile` and `web/Dockerfile` are production images (non-root, health check, Next.js standalone server).
+- **Website:** Vercel, or any container host with `web/Dockerfile`. `NEXT_PUBLIC_API_URL` is baked in at build time.
+- **API:** any container host (Railway, Render, Fly.io, AWS ECS, Cloud Run). Health check: `GET /health`.
+  The `/events` stream needs a proxy that does not buffer (`X-Accel-Buffering: no` is already sent) and an idle timeout above 30 s.
+- **Database:** managed PostgreSQL (Neon, Supabase, RDS). Use a direct or session-mode connection (LISTEN/NOTIFY does not work through transaction-mode PgBouncer).
+- **Production checklist:** `NODE_ENV=production`, strong `JWT_SECRET`, `OTP_DEV_ECHO=false`, `SMS_PROVIDER=msg91` (DLT templates) or `twilio`,
+  `PUBLIC_WEB_URL`, `CORS_ORIGINS`, `TRUST_PROXY=1` behind a load balancer. The API checks these at boot and stops if something is unsafe.
+- Before launch: verify SMS vendor request formats and AeroAPI field names against their current docs, get Terms/Privacy reviewed by a lawyer,
+  and add an error tracker (Sentry) in `web/app/error.tsx` and the API exception filter.
 
 ---
 
@@ -249,18 +292,20 @@ The same idea exists on the API side for flight data: add one class that impleme
 
 - [x] Phase 1: mobile-first UI
 - [x] Phase 2: backend (auth, flights adapter + cache, matching v1, groups, chat REST)
-- [x] Website connected to the API through a swappable service layer (login, trip request, matches, join, confirm, chat)
-- [ ] Phase 3: background matcher/worker, push notifications, WebSocket chat, flight delay re-matching
-- [ ] Phase 4: ID verification, report/block, in-app fare settlement
+- [x] Website connected to the API through a swappable service layer
+- [x] v2: new design, live updates (SSE), flight-delay updates, ride lifecycle + ratings, report/block, SOS, share-trip links,
+      refresh tokens, account deletion, background jobs, SMS adapter, Docker, CI
+- [ ] Push notifications (FCM / Web Push) so updates arrive with the app closed
+- [ ] ID verification (DigiLocker) and a trust & safety admin view for reports
 - [ ] Phase 5: Delhi IGI pilot with real users
-- [ ] Phase 6: Redis cache and queue, read replicas, PostGIS, more airports (see `ARCHITECTURE.md`)
+- [ ] Phase 6: Redis (shared rate limits, cache), read replicas, PostGIS, more airports (see `ARCHITECTURE.md`)
 
 ## Known limitations
 
-- Pickup point is a fixed placeholder (`<terminal> Arrivals, Pillar 6`).
-- Cost figures are rough estimates from a per-area base fare, not live cab prices, and FlyPool does not charge or collect them.
-- Chat refreshes by polling every 4 seconds. WebSockets come in Phase 3.
-- Login state is kept in the browser (`localStorage`), so it is per device.
-- Matching runs inside the request. Fine for a pilot, move it to a worker as traffic grows.
-- OTP is not sent by SMS yet.
-- Verified only on the embedded Postgres, not yet on a real Postgres server.
+- Drop areas are a fixed list per airport (no map search yet), and fares are rough estimates from a per-area base fare.
+- Rate limits are counted per API instance. With several instances, add a shared store (Redis) or limit at the CDN/WAF.
+- Live updates need the page open. Push notifications are the next step.
+- The session (access + refresh token) is kept in `localStorage`. Tokens are short-lived and rotate, but an httpOnly cookie is stronger
+  once web and API share one domain.
+- Reports are stored and logged; there is no admin screen to review them yet.
+- All tests pass on both the embedded Postgres (PGlite) and real PostgreSQL 16 (`E2E_DATABASE_URL=postgres://... npm run test:e2e`, against an empty database). CI runs both.

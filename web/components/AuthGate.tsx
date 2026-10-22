@@ -1,19 +1,27 @@
 "use client";
 
-import { useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
-import { service } from "@/lib/services";
+import { usePathname, useRouter } from "next/navigation";
+import { useEffect } from "react";
+import { useHasSession } from "@/lib/hooks";
+import { LiveProvider } from "./Live";
+import { Loading } from "./States";
 
-/** Client-side guard: shows children only when logged in, otherwise sends the user to /login. */
+/**
+ * Client-side guard: shows children only when logged in, otherwise sends the user to /login
+ * and brings them back to the same page (with its query string) afterwards.
+ * The API checks every request too; this is only for a smooth experience.
+ */
 export function AuthGate({ children }: { children: React.ReactNode }) {
   const router = useRouter();
-  const [ok, setOk] = useState(false);
+  const path = usePathname();
+  const ok = useHasSession();
 
   useEffect(() => {
-    if (service.auth.current()) setOk(true);
-    else router.replace("/login");
-  }, [router]);
+    if (ok !== false) return;
+    const next = path + window.location.search;
+    router.replace(`/login?next=${encodeURIComponent(next)}`);
+  }, [ok, router, path]);
 
-  if (!ok) return <p className="py-16 text-center text-muted">Loading...</p>;
-  return <>{children}</>;
+  if (!ok) return <Loading text="Checking your session..." />;
+  return <LiveProvider>{children}</LiveProvider>;
 }

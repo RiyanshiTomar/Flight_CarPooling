@@ -1,4 +1,6 @@
-# Optional: real PostgreSQL for production-like testing.   docker compose up -d
+# Full stack, production-like:   docker compose up --build
+# Website http://localhost:3000   API http://localhost:4000
+# Only the database:              docker compose up -d db
 services:
   db:
     image: postgres:16
@@ -8,5 +10,34 @@ services:
       POSTGRES_DB: flypool
     ports: ["5432:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flypool"]
+      interval: 5s
+      retries: 10
+
+  api:
+    build: ./api
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      DATABASE_URL: postgres://flypool:flypool@db:5432/flypool
+      # local demo values; real deployments must set their own (the API refuses unsafe production config)
+      NODE_ENV: development
+      JWT_SECRET: local-compose-secret-change-me-0123456789abcdef
+      OTP_DEV_ECHO: "true"
+      CORS_ORIGINS: http://localhost:3000
+      PUBLIC_WEB_URL: http://localhost:3000
+      FLIGHT_PROVIDER: mock
+    ports: ["4000:4000"]
+
+  web:
+    build:
+      context: ./web
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:4000
+        NEXT_PUBLIC_SITE_URL: http://localhost:3000
+    depends_on: [api]
+    ports: ["3000:3000"]
+
 volumes:
   pgdata:

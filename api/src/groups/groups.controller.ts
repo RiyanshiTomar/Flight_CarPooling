@@ -1,8 +1,22 @@
-import { Body, Controller, Get, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, ParseUUIDPipe, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import { IsString, IsUUID, Length } from 'class-validator';
+import { Type } from 'class-transformer';
+import {
+  ArrayMaxSize,
+  ArrayMinSize,
+  IsArray,
+  IsDateString,
+  IsInt,
+  IsOptional,
+  IsString,
+  IsUUID,
+  Length,
+  Max,
+  MaxLength,
+  Min,
+  ValidateNested,
+} from 'class-validator';
 import { AuthGuard, AuthUser, CurrentUser } from '../auth/auth.guard';
-import { DbService } from '../db/db.service';
 import { GroupsService } from './groups.service';
 
 class JoinDto {
@@ -11,13 +25,27 @@ class JoinDto {
 class MessageDto {
   @IsString() @Length(1, 1000) body: string;
 }
+class PickupDto {
+  @IsString() @Length(3, 80) pickupPoint: string;
+}
+class RatingItem {
+  @IsUUID() memberId: string;
+  @IsInt() @Min(1) @Max(5) score: number;
+  @IsOptional() @IsString() @MaxLength(300) comment?: string;
+}
+class RateDto {
+  @IsArray() @ArrayMinSize(1) @ArrayMaxSize(3) @ValidateNested({ each: true }) @Type(() => RatingItem) ratings: RatingItem[];
+}
+class MessagesQuery {
+  @IsOptional() @IsDateString() after?: string;
+}
 
 @ApiTags('groups')
 @ApiBearerAuth()
 @UseGuards(AuthGuard)
 @Controller('groups')
 export class GroupsController {
-  constructor(private readonly groups: GroupsService, private readonly db: DbService) {}
+  constructor(private readonly groups: GroupsService) {}
 
   @Get(':id')
   get(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
@@ -34,32 +62,40 @@ export class GroupsController {
     return this.groups.confirm(u.id, id);
   }
 
-  // --- chat (REST for now; Phase 3 adds WebSocket push on top of the same table) ---
+  /** Leave this group but keep looking: you get a fresh group of one. */
+  @Post(':id/leave')
+  leave(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
+    return this.groups.leave(u.id, id);
+  }
+
+  @Patch(':id/pickup')
+  pickup(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string, @Body() dto: PickupDto) {
+    return this.groups.updatePickup(u.id, id, dto.pickupPoint);
+  }
+
+  @Post(':id/start')
+  start(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
+    return this.groups.start(u.id, id);
+  }
+
+  @Post(':id/complete')
+  complete(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string) {
+    return this.groups.complete(u.id, id);
+  }
+
+  @Post(':id/ratings')
+  rate(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string, @Body() dto: RateDto) {
+    return this.groups.rate(u.id, id, dto.ratings);
+  }
+
+  // --- chat: REST for history and sending; new messages are announced over GET /events (SSE) ---
   @Get(':id/messages')
-  async messages(
-    @CurrentUser() u: AuthUser,
-    @Param('id', ParseUUIDPipe) id: string,
-    @Query('after') after?: string,
-  ) {
-    await this.groups.assertMember(u.id, id);
-    const rows = await this.db.query(
-      `select m.id, m.body, m.created_at, m.user_id = $2 as mine,
-              split_part(coalesce(usr.name, 'Traveller'), ' ', 1) as sender
-       from messages m join users usr on usr.id = m.user_id
-       where m.group_id = $1 and ($3::timestamptz is null or m.created_at > $3::timestamptz)
-       order by m.created_at asc limit 200`,
-      [id, u.id, after ?? null],
-    );
-    return rows;
+  messages(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string, @Query() q: MessagesQuery) {
+    return this.groups.messages(u.id, id, q.after);
   }
 
   @Post(':id/messages')
-  async send(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string, @Body() dto: MessageDto) {
-    await this.groups.assertMember(u.id, id);
-    const [row] = await this.db.query(
-      'insert into messages (group_id, user_id, body) values ($1,$2,$3) returning id, body, created_at',
-      [id, u.id, dto.body.trim()],
-    );
-    return { ...row, mine: true };
+  send(@CurrentUser() u: AuthUser, @Param('id', ParseUUIDPipe) id: string, @Body() dto: MessageDto) {
+    return this.groups.send(u.id, id, dto.body);
   }
 }
